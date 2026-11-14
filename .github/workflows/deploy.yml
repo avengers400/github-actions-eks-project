@@ -1,0 +1,136 @@
+
+name: Deploy Application to AWS EKS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER: devops-eks-cluster
+  ECR_REPOSITORY: fastapi-app
+  K8S_NAMESPACE: devops
+
+jobs:
+  test:
+    name: Test Application
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Tests
+        run: python -m pytest -v
+
+  build:
+    name: Build Scan and Push Docker Image
+    needs: test
+    runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS Identity
+        run: aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker Image
+        id: build-image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          docker build -t "$IMAGE" .
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Scan Docker Image
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ${{ steps.build-image.outputs.image }}
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Push Image to ECR
+        run: |
+          docker push "${{ steps.build-image.outputs.image }}"
+
+  deploy:
+    name: Deploy Application to EKS
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure EKS Access
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER"
+
+      - name: Deploy to Kubernetes
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          kubectl apply -f k8s/service.yaml
+
+          sed "s|IMAGE_PLACEHOLDER|$IMAGE|g" \
+            k8s/deployment.yaml | kubectl apply -f -
+
+      - name: Verify Deployment
+        run: |
+          kubectl rollout status \
+            deployment/fastapi-app \
+            -n "$K8S_NAMESPACE" \
+            --timeout=300s
+
+          kubectl get pods -n "$K8S_NAMESPACE"
+
+          kubectl get svc -n "$K8S_NAMESPACE"
+
+      - name: Rollback on Failure
+        if: failure()
+        run: |
+          kubectl rollout undo \
+            deployment/fastapi-app \
+            -n "$K8S_NAMESPACE" || true
